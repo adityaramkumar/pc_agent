@@ -1,12 +1,16 @@
-"""Thin wrapper around the google-genai SDK.
+"""Wrapper around the google-genai SDK.
 
-Two distinct call modes (Gemini does *not* allow JSON-mode and tools together):
+Three capabilities exposed:
 
-* `agentic_turn(history, tools)` — used inside the action loop. Tools enabled,
-  no JSON mode. Returns either a `function_call` or free-text continuation.
-* `final_answer(question, retrieved)` — no tools, response_mime_type=
-  application/json with a schema describing `{answer, citations}`. This is the
-  call that produces the side-panel-rendered output.
+1. Embeddings (`embed_documents`, `embed_query`) with task_type asymmetry
+   and exponential backoff on 429/5xx.
+2. `agentic_turn(history)`, the tool-calling round-trip used by the action
+   loop. Returns either a function call or free text.
+3. `final_answer(question, retrieved)`, a JSON-mode single-shot that turns
+   a question + retrieved memories into a structured `{answer, citations}`.
+
+Gemini doesn't allow `response_mime_type=application/json` together with
+`tools`, which is why the two call modes are separate methods.
 """
 
 from __future__ import annotations
@@ -16,19 +20,28 @@ import json
 import logging
 from collections.abc import Sequence
 from dataclasses import dataclass
-from datetime import UTC, datetime
 from typing import Any
 
 from google import genai
 from google.genai import types as genai_types
 
 from app.config import Settings, get_settings
+from app.prompts import (
+    AGENTIC_SYSTEM_INSTRUCTION,
+    FINAL_ANSWER_SCHEMA,
+    FINAL_ANSWER_SYSTEM_INSTRUCTION,
+    build_final_answer_prompt,
+)
 from app.store import RetrievedChunk
+from app.tools import all_tools
 
 logger = logging.getLogger(__name__)
 
 
 _RETRYABLE_STATUSES = {429, 500, 502, 503, 504}
+_MAX_EMBED_RETRIES = 5
+_EMBED_INITIAL_DELAY = 1.0
+_EMBED_MAX_DELAY = 32.0
 
 
 @dataclass(slots=True)
@@ -49,136 +62,6 @@ class FinalAnswer:
     citations: list[Citation]
 
 
-_FINAL_ANSWER_SCHEMA: dict[str, Any] = {
-    "type": "object",
-    "properties": {
-        "answer": {"type": "string"},
-        "citations": {
-            "type": "array",
-            "items": {
-                "type": "object",
-                "properties": {
-                    "url": {"type": "string"},
-                    "ts": {"type": "integer"},
-                    "snippet": {"type": "string"},
-                },
-                "required": ["url", "ts", "snippet"],
-            },
-        },
-    },
-    "required": ["answer", "citations"],
-}
-
-
-_SYSTEM_INSTRUCTION = (
-    "You are pc_agent, the user's personal browser-history assistant. "
-    "Answer the user's question using ONLY the provided memories from their "
-    "own browsing. If the memories don't contain enough information, say so "
-    "honestly rather than guessing. Always include citations: copy the "
-    "URL/ts/snippet of every memory you actually used. Be concise."
-)
-
-
-_AGENTIC_SYSTEM_INSTRUCTION = (
-    "You are pc_agent, the user's personal browser-history assistant. "
-    "You have three tools:\n"
-    "  - search_memory(query): search the user's local browsing history.\n"
-    "  - visit_page(url, wait_for_selector?): open a tab in the background\n"
-    "    and read the page. Use ONLY when the user asks you to go check\n"
-    "    something live (e.g. 'check what X replied').\n"
-    "  - extract_from_page(url, what, css_hint?): read a known page with a\n"
-    "    targeted extraction. Use for SPAs (Gmail, LinkedIn) where Readability\n"
-    "    returns garbage; pass a CSS selector hint for the relevant region.\n\n"
-    "Guidance:\n"
-    "  - Always start with search_memory to see what the user already has.\n"
-    "  - Only use visit_page / extract_from_page when memory alone is\n"
-    "    insufficient and the user is clearly asking you to fetch.\n"
-    "  - When you have enough information, write a short final answer\n"
-    "    naming the URLs and timestamps you used. The system will then\n"
-    "    convert your answer into a structured response with citations."
-)
-
-
-# --- Tool declarations ---------------------------------------------------
-
-SEARCH_MEMORY_TOOL = genai_types.FunctionDeclaration(
-    name="search_memory",
-    description=(
-        "Search the user's local browsing history (pages, selections, form "
-        "inputs they've sent). Returns the top relevant snippets."
-    ),
-    parameters=genai_types.Schema(
-        type=genai_types.Type.OBJECT,
-        properties={
-            "query": genai_types.Schema(
-                type=genai_types.Type.STRING,
-                description="A natural-language search query.",
-            ),
-        },
-        required=["query"],
-    ),
-)
-
-VISIT_PAGE_TOOL = genai_types.FunctionDeclaration(
-    name="visit_page",
-    description=(
-        "Open a URL in a background tab and return the page's main content. "
-        "Uses Readability to extract the article-style text. Best for "
-        "article/blog/docs pages."
-    ),
-    parameters=genai_types.Schema(
-        type=genai_types.Type.OBJECT,
-        properties={
-            "url": genai_types.Schema(type=genai_types.Type.STRING),
-            "wait_for_selector": genai_types.Schema(
-                type=genai_types.Type.STRING,
-                description="Optional CSS selector to wait for before extracting.",
-            ),
-        },
-        required=["url"],
-    ),
-)
-
-EXTRACT_FROM_PAGE_TOOL = genai_types.FunctionDeclaration(
-    name="extract_from_page",
-    description=(
-        "Open a URL and extract content from a specific CSS-targeted region. "
-        "Use this for SPAs (Gmail, LinkedIn, Slack web) where the main "
-        "content lives in dynamic regions and Readability returns junk."
-    ),
-    parameters=genai_types.Schema(
-        type=genai_types.Type.OBJECT,
-        properties={
-            "url": genai_types.Schema(type=genai_types.Type.STRING),
-            "what": genai_types.Schema(
-                type=genai_types.Type.STRING,
-                description="What to look for (free-text, included in the result).",
-            ),
-            "css_hint": genai_types.Schema(
-                type=genai_types.Type.STRING,
-                description="A CSS selector for the region of interest.",
-            ),
-        },
-        required=["url", "what"],
-    ),
-)
-
-
-def all_tools() -> list[genai_types.Tool]:
-    return [
-        genai_types.Tool(
-            function_declarations=[
-                SEARCH_MEMORY_TOOL,
-                VISIT_PAGE_TOOL,
-                EXTRACT_FROM_PAGE_TOOL,
-            ]
-        )
-    ]
-
-
-# --- Agentic-turn output -------------------------------------------------
-
-
 @dataclass(slots=True)
 class FunctionCall:
     name: str
@@ -187,7 +70,7 @@ class FunctionCall:
 
 @dataclass(slots=True)
 class AgenticTurn:
-    """Result of one round-trip with the model in tool-calling mode."""
+    """One round-trip with the model in tool-calling mode."""
 
     function_call: FunctionCall | None
     text: str | None
@@ -211,11 +94,14 @@ class GeminiClient:
     def raw(self) -> genai.Client:
         return self._client
 
+    # --- Embeddings ------------------------------------------------------
+
     async def embed_documents(self, texts: Sequence[str]) -> EmbedResult:
         """Embed a batch of texts as RETRIEVAL_DOCUMENT (asymmetric)."""
         return await self._embed(texts, task_type="RETRIEVAL_DOCUMENT")
 
     async def embed_query(self, text: str) -> list[float]:
+        """Embed a single query string as RETRIEVAL_QUERY."""
         result = await self._embed([text], task_type="RETRIEVAL_QUERY")
         return result.vectors[0]
 
@@ -228,9 +114,9 @@ class GeminiClient:
             output_dimensionality=self._settings.embedding_dim,
         )
 
-        delay = 1.0
+        delay = _EMBED_INITIAL_DELAY
         last_exc: Exception | None = None
-        for attempt in range(5):
+        for attempt in range(_MAX_EMBED_RETRIES):
             try:
                 response = await asyncio.to_thread(
                     self._client.models.embed_content,
@@ -241,23 +127,26 @@ class GeminiClient:
                 vectors = [list(emb.values or []) for emb in (response.embeddings or [])]
                 return EmbedResult(vectors=vectors)
             except Exception as exc:  # pragma: no cover - exercised in integration
-                status = _extract_status(exc)
-                if status not in _RETRYABLE_STATUSES or attempt == 4:
+                status_code = _extract_status(exc)
+                if status_code not in _RETRYABLE_STATUSES or attempt == _MAX_EMBED_RETRIES - 1:
                     raise
-                logger.warning("embed retry %d after %.1fs (status=%s)", attempt + 1, delay, status)
+                logger.warning(
+                    "embed retry %d after %.1fs (status=%s)", attempt + 1, delay, status_code
+                )
                 last_exc = exc
                 await asyncio.sleep(delay)
-                delay = min(delay * 2, 32.0)
+                delay = min(delay * 2, _EMBED_MAX_DELAY)
 
         raise RuntimeError("embed retries exhausted") from last_exc
 
+    # --- Agentic turn (tools, no JSON) -----------------------------------
+
     async def agentic_turn(self, history: Sequence[Any]) -> AgenticTurn:
-        """One round-trip with the model in tool-calling mode."""
         # mypy can't reconcile the SDK's covariant `list[Tool|...]` with our
         # plain `list[Tool]`, so cast at the boundary.
         tools: Any = all_tools()
         config = genai_types.GenerateContentConfig(
-            system_instruction=_AGENTIC_SYSTEM_INSTRUCTION,
+            system_instruction=AGENTIC_SYSTEM_INSTRUCTION,
             tools=tools,
             temperature=0.2,
         )
@@ -267,7 +156,9 @@ class GeminiClient:
             contents=list(history),
             config=config,
         )
-        return _parse_agentic_response(response)
+        return parse_agentic_response(response)
+
+    # --- Final answer (JSON, no tools) -----------------------------------
 
     async def final_answer(
         self,
@@ -275,13 +166,12 @@ class GeminiClient:
         question: str,
         retrieved: Sequence[RetrievedChunk],
     ) -> FinalAnswer:
-        """Single-shot answer-with-citations call. No tools, JSON output."""
-        prompt = _build_final_prompt(question, retrieved)
+        prompt = build_final_answer_prompt(question, retrieved)
 
         config = genai_types.GenerateContentConfig(
-            system_instruction=_SYSTEM_INSTRUCTION,
+            system_instruction=FINAL_ANSWER_SYSTEM_INSTRUCTION,
             response_mime_type="application/json",
-            response_schema=_FINAL_ANSWER_SCHEMA,
+            response_schema=FINAL_ANSWER_SCHEMA,
             temperature=0.2,
         )
 
@@ -292,10 +182,14 @@ class GeminiClient:
             config=config,
         )
 
-        return _parse_final_answer(response)
+        return parse_final_answer(response)
 
 
-def _parse_agentic_response(response: Any) -> AgenticTurn:
+# --- Response parsers (pure, easy to unit-test) -------------------------
+
+
+def parse_agentic_response(response: Any) -> AgenticTurn:
+    """Turn a google-genai Content response into our AgenticTurn dataclass."""
     candidates = getattr(response, "candidates", None) or []
     if not candidates:
         return AgenticTurn(function_call=None, text=None, raw_content=None)
@@ -309,13 +203,12 @@ def _parse_agentic_response(response: Any) -> AgenticTurn:
         function_call = getattr(part, "function_call", None)
         if function_call is not None:
             args = getattr(function_call, "args", {}) or {}
-            # google.genai gives us a dict-like; coerce to plain dict.
             try:
-                args = dict(args)
+                args_dict = dict(args)
             except Exception:
-                args = {}
-            fn_call = FunctionCall(name=function_call.name, args=args)
-            break  # only one function call per turn for our purposes
+                args_dict = {}
+            fn_call = FunctionCall(name=function_call.name, args=args_dict)
+            break  # one function call per turn is all we handle
         text = getattr(part, "text", None)
         if text:
             text_pieces.append(text)
@@ -327,31 +220,8 @@ def _parse_agentic_response(response: Any) -> AgenticTurn:
     )
 
 
-def _build_final_prompt(question: str, retrieved: Sequence[RetrievedChunk]) -> str:
-    if not retrieved:
-        body = "(no memories matched the question)"
-    else:
-        body = "\n\n".join(_format_chunk(i, c) for i, c in enumerate(retrieved, start=1))
-    return (
-        f"# Question\n{question}\n\n"
-        f"# Memories from the user's browsing\n{body}\n\n"
-        "# Task\nAnswer the question using only the memories above. "
-        "Include citations for the memories you used."
-    )
-
-
-def _format_chunk(idx: int, chunk: RetrievedChunk) -> str:
-    iso = datetime.fromtimestamp(chunk.ts / 1000, tz=UTC).isoformat()
-    title = chunk.title or chunk.url
-    return (
-        f"[{idx}] {title}\n"
-        f"    url: {chunk.url}\n"
-        f"    ts:  {chunk.ts}  ({iso})\n"
-        f"    text: {chunk.text}"
-    )
-
-
-def _parse_final_answer(response: Any) -> FinalAnswer:
+def parse_final_answer(response: Any) -> FinalAnswer:
+    """Turn the JSON-mode response into a FinalAnswer. Tolerates malformed JSON."""
     raw = getattr(response, "text", None)
     if not raw:
         return FinalAnswer(answer="(no response from model)", citations=[])
@@ -380,6 +250,9 @@ def _extract_status(exc: Exception) -> int | None:
     return None
 
 
+# --- Cached singleton -----------------------------------------------------
+
+
 _cached_client: GeminiClient | None = None
 
 
@@ -395,8 +268,6 @@ def reset_client_for_tests() -> None:
     _cached_client = None
 
 
-# Surface the genai types module for callers that need to construct
-# `FunctionDeclaration` etc. without importing google.genai directly.
 __all__ = [
     "AgenticTurn",
     "Citation",
@@ -404,8 +275,8 @@ __all__ = [
     "FinalAnswer",
     "FunctionCall",
     "GeminiClient",
-    "all_tools",
-    "genai_types",
     "get_gemini_client",
+    "parse_agentic_response",
+    "parse_final_answer",
     "reset_client_for_tests",
 ]

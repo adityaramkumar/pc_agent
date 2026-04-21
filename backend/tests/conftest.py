@@ -10,7 +10,8 @@ from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
 from app.config import Settings
-from app.main import _store_dep, create_app
+from app.deps import _store_dep
+from app.main import create_app
 from app.store import Store
 
 

@@ -2,10 +2,10 @@
 
 A single-writer, many-reader SQLite DB. Tables:
 
-  events        — raw captures from the extension
-  chunks        — derived text chunks (populated by app/processor.py later)
-  chunk_vectors — vec0 virtual table holding 768-dim embeddings keyed by chunk_id
-  chunks_fts    — FTS5 virtual table mirroring chunks.text for keyword search
+  events        : raw captures from the extension
+  chunks        : derived text chunks (populated by app/processor.py later)
+  chunk_vectors : vec0 virtual table holding 768-dim embeddings keyed by chunk_id
+  chunks_fts    : FTS5 virtual table mirroring chunks.text for keyword search
 
 Connections are created per-call via a small context manager so each request
 gets its own; SQLite handles concurrent readers fine and our writes are
@@ -26,7 +26,7 @@ from typing import Any
 # Prefer the pysqlite3 wheel when present: it bundles a recent sqlite compiled
 # with extension loading enabled, which the stdlib `sqlite3` is missing on some
 # distributions (notably macOS Python.org builds). Fall back to the stdlib
-# module when the wheel isn't available — Linux Python ships with extensions
+# module when the wheel isn't available. Linux Python ships with extensions
 # enabled so CI is fine.
 try:
     from pysqlite3 import dbapi2 as sqlite3  # type: ignore[import-not-found, unused-ignore]

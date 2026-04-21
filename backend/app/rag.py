@@ -2,7 +2,7 @@
 
 The fused list of `RetrievedChunk` is what gets stuffed into the LLM
 prompt. We intentionally keep the formula simple (RRF + linear recency
-boost) — there's no offline eval harness, so cleverness here is hard
+boost) because there's no offline eval harness, so cleverness here is hard
 to validate.
 """
 
@@ -79,7 +79,7 @@ class Retriever:
 
         rankings: dict[str, list[int]] = {}
 
-        # Vector branch — async because it may hit the network.
+        # Vector branch: async because it may hit the network.
         try:
             vector = await self._client.embed_query(query)
             vec_results = self._store.vector_search(vector, k=self._config.vector_k)
@@ -87,7 +87,7 @@ class Retriever:
         except Exception as exc:
             logger.warning("vector search failed, falling back to FTS only: %s", exc)
 
-        # FTS5 branch — pure SQLite, no failure modes worth degrading for.
+        # FTS5 branch: pure SQLite, no failure modes worth degrading for.
         fts_results = self._store.fts_search(query, k=self._config.fts_k)
         rankings["fts"] = [chunk_id for chunk_id, _ in fts_results]
 
