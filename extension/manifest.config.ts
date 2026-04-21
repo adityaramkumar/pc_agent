@@ -6,7 +6,7 @@ export default defineManifest({
   name: "pc_agent",
   version: pkg.version,
   description: pkg.description,
-  permissions: ["tabs", "scripting", "storage", "sidePanel", "activeTab"],
+  permissions: ["tabs", "scripting", "storage", "sidePanel", "activeTab", "alarms"],
   host_permissions: ["<all_urls>", "http://127.0.0.1:8765/*"],
   background: {
     service_worker: "src/background/sw.ts",
