@@ -4,6 +4,27 @@ import { DEFAULT_SETTINGS, type UserSettings } from "./types";
 
 const SETTINGS_KEY = "pc_agent.settings";
 
+/**
+ * Suffix-match: an entry "example.com" blocks "example.com" and any
+ * subdomain like "www.example.com", but not "notexample.com".
+ */
+export function isHostBlocked(host: string, blocklist: string[]): boolean {
+  const h = host.toLowerCase();
+  return blocklist.some((entry) => {
+    const e = entry.trim().toLowerCase();
+    if (!e) return false;
+    return h === e || h.endsWith("." + e);
+  });
+}
+
+export function isUrlBlocked(url: string, blocklist: string[]): boolean {
+  try {
+    return isHostBlocked(new URL(url).host, blocklist);
+  } catch {
+    return false;
+  }
+}
+
 export async function loadSettings(): Promise<UserSettings> {
   const stored = await chrome.storage.local.get(SETTINGS_KEY);
   const raw = stored[SETTINGS_KEY] as Partial<UserSettings> | undefined;

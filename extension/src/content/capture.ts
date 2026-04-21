@@ -17,13 +17,29 @@
 import { Readability, isProbablyReaderable } from "@mozilla/readability";
 
 import type { CaptureMessage } from "../lib/messages";
-import type { EventType, IngestEvent } from "../lib/types";
+import { isHostBlocked, loadSettings, watchSettings } from "../lib/storage";
+import { DEFAULT_SETTINGS, type EventType, type IngestEvent, type UserSettings } from "../lib/types";
 
 const SELECTION_DEBOUNCE_MS = 600;
 const INPUT_DEBOUNCE_MS = 800;
 const MIN_SELECTION_LEN = 8;
 const MIN_INPUT_LEN = 2;
 const MAX_TEXT_LEN = 50_000;
+
+let settings: UserSettings = { ...DEFAULT_SETTINGS };
+
+void loadSettings().then((s) => {
+  settings = s;
+});
+watchSettings((s) => {
+  settings = s;
+});
+
+function captureAllowed(): boolean {
+  if (settings.paused) return false;
+  if (isHostBlocked(location.host, settings.blocklist)) return false;
+  return true;
+}
 
 const SENSITIVE_AUTOCOMPLETE = new Set([
   "current-password",
@@ -37,6 +53,7 @@ const SENSITIVE_AUTOCOMPLETE = new Set([
 ]);
 
 function send(event: IngestEvent): void {
+  if (!captureAllowed()) return;
   const message: CaptureMessage = { kind: "capture", event };
   // The SW may not be alive; sendMessage swallows that case for us. We catch
   // any thrown errors so the page never sees a violation.

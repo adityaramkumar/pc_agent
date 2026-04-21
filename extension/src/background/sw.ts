@@ -18,7 +18,8 @@ import {
   type RunToolMessage,
   type RunToolResult,
 } from "../lib/messages";
-import type { IngestEvent } from "../lib/types";
+import { isUrlBlocked, loadSettings, watchSettings } from "../lib/storage";
+import { DEFAULT_SETTINGS, type IngestEvent, type UserSettings } from "../lib/types";
 
 const FLUSH_INTERVAL_MIN = 5 / 60;
 const DEDUPE_WINDOW_MS = 30_000;
@@ -28,6 +29,14 @@ const TAB_LOAD_TIMEOUT_MS = 15_000;
 
 const buffer: IngestEvent[] = [];
 const recentByKey = new Map<string, number>();
+
+let settings: UserSettings = { ...DEFAULT_SETTINGS };
+void loadSettings().then((s) => {
+  settings = s;
+});
+watchSettings((s) => {
+  settings = s;
+});
 
 // --- Capture pipeline ----------------------------------------------------
 
@@ -43,6 +52,11 @@ function pruneRecent(now: number): void {
 }
 
 function enqueue(event: IngestEvent): void {
+  // Defense in depth: the content script also checks these, but the SW is the
+  // last line before the network. Pause / blocklist apply here too.
+  if (settings.paused) return;
+  if (isUrlBlocked(event.url, settings.blocklist)) return;
+
   const key = dedupeKey(event);
   const last = recentByKey.get(key);
   if (last !== undefined && event.ts - last < DEDUPE_WINDOW_MS) return;
@@ -125,6 +139,9 @@ async function runTool(message: RunToolMessage): Promise<RunToolResult> {
   const { tool, args } = message;
   const url = args.url;
   if (!url) return { ok: false, error: "missing url" };
+  if (isUrlBlocked(url, settings.blocklist)) {
+    return { ok: false, url, error: "url is on the blocklist; refusing to visit" };
+  }
 
   let tab: chrome.tabs.Tab | null = null;
   try {
