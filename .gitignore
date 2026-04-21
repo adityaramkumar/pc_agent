@@ -1,0 +1,37 @@
+# secrets
+.env
+.env.*
+!.env.example
+
+# python
+__pycache__/
+*.pyc
+.venv/
+venv/
+.mypy_cache/
+.pytest_cache/
+.ruff_cache/
+backend/dist/
+backend/*.egg-info/
+backend/.venv/
+
+# node / extension
+node_modules/
+extension/dist/
+*.log
+
+# data — never commit captured memory
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+.pc_agent/
+
+# editors
+.vscode/
+.idea/
+*.swp
+
+# os
+.DS_Store
+Thumbs.db
