@@ -1,14 +1,14 @@
 /**
  * Content script. Three capture surfaces:
  *
- *   1. Page extraction — Mozilla Readability on document_idle. Falls back
+ *   1. Page extraction: Mozilla Readability on document_idle. Falls back
  *      to title + visible body text if Readability declines (which happens
  *      on most SPAs and short pages).
- *   2. Selections — `selectionchange` debounced; sends a `selection` event
+ *   2. Selections: `selectionchange` debounced; sends a `selection` event
  *      whenever the user finishes highlighting non-trivial text.
- *   3. Form inputs — captures non-password fields on form submit and
- *      debounced trailing-edge `input` (so we get search queries, message
- *      drafts, etc., but never passwords / cc numbers / OTP codes).
+ *   3. Form inputs: captured on form submit and on debounced trailing-edge
+ *      `input` (so we get search queries and message drafts, but never
+ *      passwords, credit card numbers, or OTP codes).
  *
  * All events are forwarded to the service worker via runtime.sendMessage;
  * the SW handles dedupe, batching, and the actual POST to the backend.

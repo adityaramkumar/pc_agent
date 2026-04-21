@@ -179,7 +179,7 @@ export function ActivityTab() {
       {error && <div className="error-banner">{error}</div>}
       {events.length === 0 && !loading && !error && (
         <p className="muted">
-          No memories yet. Start browsing some pages — captures will appear here.
+          No memories yet. Start browsing some pages and captures will appear here.
         </p>
       )}
 

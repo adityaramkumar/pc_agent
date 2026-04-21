@@ -46,7 +46,7 @@ export async function postIngest(events: IngestEvent[]): Promise<IngestResponse 
       body: JSON.stringify(body),
     });
   } catch (err) {
-    // Backend may simply be down — that's fine, we just drop the batch.
+    // Backend may simply be down. That's fine; we just drop the batch.
     console.debug("[pc_agent] ingest network error", err);
     return null;
   }
