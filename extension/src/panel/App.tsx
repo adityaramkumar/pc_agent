@@ -1,6 +1,6 @@
 import "./App.css";
 
-export function App(): JSX.Element {
+export function App() {
   return (
     <main className="panel">
       <h1>pc_agent</h1>
