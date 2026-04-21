@@ -45,7 +45,6 @@ Two processes: the extension and a local Python server. See [the action loop sec
 ```bash
 git clone git@github.com:adityaramkumar/pc_agent.git
 cd pc_agent
-./scripts/setup-git-identity.sh   # only if you'll commit; safe to skip otherwise
 
 # --- backend ---
 cd backend
@@ -102,11 +101,6 @@ Out of scope for v0 (might revisit):
 - Audio, video, non-browser apps.
 - Background proactive notifications (a scheduler that runs saved queries).
 - Fine-grained PII redaction (rely on domain blocklist + pause for now).
-
-## Repo conventions
-
-- **Per-repo git identity**: run `./scripts/setup-git-identity.sh` once after cloning. It scopes `user.name` / `user.email` to this repo only (never touches your global config) and activates the in-tree `.githooks/pre-commit` that hard-blocks commits with the wrong identity.
-- **Commit cadence**: small, scoped commits straight to `main`. CI runs on every push.
 
 ## License
 
