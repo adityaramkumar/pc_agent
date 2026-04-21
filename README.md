@@ -1,107 +1,137 @@
 # pc_agent
 
-Personal browser memory + lightweight action agent, powered by Gemini.
+Your browser history remembers the URLs you visited. pc_agent remembers what was on the page.
 
 [![backend CI](https://github.com/adityaramkumar/pc_agent/actions/workflows/backend.yml/badge.svg)](https://github.com/adityaramkumar/pc_agent/actions/workflows/backend.yml)
 [![extension CI](https://github.com/adityaramkumar/pc_agent/actions/workflows/extension.yml/badge.svg)](https://github.com/adityaramkumar/pc_agent/actions/workflows/extension.yml)
 
-## What it does
+## The problem
 
-A research prototype with three loosely-coupled capabilities:
+You read a great article about housing policy three weeks ago. You can't remember the name of it. You remember the author drank a lot of coffee and worked at a magazine, but Google is useless because you can't remember any of the words they used.
 
-- **Capture** — a Chrome extension passively records pages you visit, text you highlight, and form fields you submit (passwords excluded). Sensible default blocklist.
-- **Memory** — a local Python backend chunks, embeds, and indexes everything in SQLite + [`sqlite-vec`](https://github.com/asg017/sqlite-vec). Hybrid retrieval (vector + FTS5 + recency) makes natural-language questions like *"what was that pricing page Sam sent me last Tuesday?"* actually work.
-- **Action (lite)** — Gemini function-calling lets the agent open a tab in the background, extract structured content, and answer questions like *"check what Priya replied to my last LinkedIn message"* without pixel-clicking.
+Every knowledge worker has this problem. Browser history is a time-ordered list, so it's only useful if you remember *when*. Search history is only useful if you remember *what you typed*. Neither helps when you only remember the vibe.
 
-Everything lives on `localhost`. Single API key (`GOOGLE_API_KEY`). No cloud, no auth, no multi-user. Designed to work for *you* on *your* machine.
+## What pc_agent does
 
-## Demo
+Three things:
 
-_Side-panel screenshot/GIF goes here once the UI lands._
+1. **It watches.** A Chrome extension quietly saves the pages you read, the text you highlight, and the messages you send through forms. Passwords and credit card fields are skipped. Banks and password managers are skipped.
+2. **It remembers.** A tiny Python server running on your own machine turns all of that into a searchable memory. Nothing leaves your computer except the occasional request to Google's Gemini API (for embeddings and answering your questions).
+3. **It answers.** Open the side panel. Ask a question in plain English. Get an answer with links back to the original pages.
 
-## Architecture
+Example questions that should work after a week of browsing:
+
+- "What was that pricing page Sam sent me last Tuesday?"
+- "Find the GitHub issue I read about websocket reconnects."
+- "What was I writing to Ana yesterday before I got distracted?"
+- "Summarize everything I read about rent control this month."
+
+If the answer needs something fresh, pc_agent can also open a tab in the background and go look. Questions like *"check what Priya replied on LinkedIn"* work by opening LinkedIn in a hidden tab, reading the reply, and closing the tab. You see the answer in the side panel.
+
+## How it's built
 
 ```mermaid
 flowchart LR
     user((You)) -->|browses| pages[Web pages]
-    pages --> cs[Content script<br/>DOM + selection + input capture]
-    cs --> sw[Service worker<br/>batch + dedupe]
+    pages --> cs[Content script<br/>reads the page]
+    cs --> sw[Service worker<br/>batches events]
     sw -->|HTTP localhost| api[FastAPI backend]
-    api --> proc[Processor<br/>clean, chunk, embed via Gemini]
-    proc --> store[(SQLite + sqlite-vec)]
-    user -->|asks| panel[Side panel UI]
-    panel -->|query| api
-    api --> rag[Retriever + Gemini LLM]
+    api --> proc[Chunk + embed<br/>with Gemini]
+    proc --> store[(SQLite)]
+    user -->|asks| panel[Side panel]
+    panel -->|question| api
+    api --> rag[Search + answer<br/>with Gemini]
     rag --> store
     rag --> panel
-    panel -->|action: 'check X'| sw
-    sw -->|open tab + run script| cs
+    panel -->|'check LinkedIn'| sw
+    sw -->|opens tab| cs
 ```
 
-Two processes: the extension and a local Python server. See [the action loop section](#action-loop) for how the side panel orchestrates Gemini's function-calling without exposing the backend to the browser's service-worker lifecycle.
+Two pieces, both running on your laptop:
+
+- **A Chrome extension** (`extension/`), which captures what you read and shows the side panel UI.
+- **A Python server** (`backend/`) running on `127.0.0.1:8765`, which stores your data in one SQLite file and talks to Gemini on your behalf.
+
+Nothing is hosted. There is no cloud service. If you delete the SQLite file, the memory is gone.
 
 ## Quick start
 
+You need Python 3.11+ and Node 20+. You also need a Gemini API key, which is free to get at [aistudio.google.com/apikey](https://aistudio.google.com/apikey).
+
+### 1. Start the backend
+
 ```bash
 git clone git@github.com:adityaramkumar/pc_agent.git
-cd pc_agent
-
-# --- backend ---
-cd backend
-python -m venv .venv && source .venv/bin/activate
+cd pc_agent/backend
+python -m venv .venv
+source .venv/bin/activate
 pip install -e '.[dev]'
-cp .env.example .env              # then add GOOGLE_API_KEY
+cp .env.example .env
+# open .env and paste in your GOOGLE_API_KEY
 uvicorn app.main:app --host 127.0.0.1 --port 8765 --reload
-
-# --- extension (in another terminal) ---
-cd extension
-npm install
-npm run build
-# then load extension/dist in chrome://extensions (Developer mode -> Load unpacked)
 ```
 
-The backend binds to `127.0.0.1` only — there is no auth, so it must never be exposed on a public interface.
+The server binds to `127.0.0.1` on purpose. There's no authentication, so it must not be exposed to the outside world.
 
-## Configuration
+### 2. Build and load the extension
 
-Backend reads from `backend/.env`:
+```bash
+cd ../extension
+npm install
+npm run build
+```
 
-- `GOOGLE_API_KEY` (required) — get one at [aistudio.google.com/apikey](https://aistudio.google.com/apikey). The free tier covers personal dogfooding comfortably.
-- `LLM_MODEL` (default `gemini-2.5-flash`) — set to `gemini-2.5-pro` for harder questions.
-- `EMBEDDING_MODEL` (default `gemini-embedding-001`) — 768-dim output, matched to the `sqlite-vec` schema.
-- `DB_PATH` (default `~/.pc_agent/memory.db`) — where captured memory lives.
-- `BACKEND_HOST` / `BACKEND_PORT` (default `127.0.0.1` / `8765`).
+Then in Chrome:
 
-Extension reads from `chrome.storage.local` (set via the side panel's Activity tab):
+1. Go to `chrome://extensions`.
+2. Turn on "Developer mode" (top right).
+3. Click "Load unpacked" and pick the `extension/dist` folder.
+4. Pin the pc_agent icon to your toolbar.
+5. Click the icon to open the side panel.
 
-- Master pause toggle.
-- Domain blocklist (defaults: banks, password managers, `accounts.google.com`, anything in incognito).
-- Optional allowlist mode (off by default).
+Now browse the web for a day or two. Come back and ask a question.
+
+## Settings
+
+All settings live in `backend/.env`:
+
+| Setting | Default | What it does |
+|---|---|---|
+| `GOOGLE_API_KEY` | (required) | Your key from [aistudio.google.com/apikey](https://aistudio.google.com/apikey). |
+| `LLM_MODEL` | `gemini-2.5-flash` | The chat model. Set to `gemini-2.5-pro` for harder questions. |
+| `EMBEDDING_MODEL` | `gemini-embedding-001` | The embedding model. |
+| `DB_PATH` | `~/.pc_agent/memory.db` | Where your captured data is stored. |
+| `BACKEND_HOST` | `127.0.0.1` | Must stay on localhost. |
+| `BACKEND_PORT` | `8765` | Change if this port is taken. |
+
+Runtime settings (pause capture, add domains to the blocklist) live in the extension's Activity tab and are stored locally by Chrome.
 
 ## Privacy
 
-- **What's captured**: page URL + title + extracted main content, text you highlight, non-password form values on `submit`.
-- **What's never captured**: `<input type="password">`, fields with sensitive `autocomplete` attributes (`cc-number`, `one-time-code`, etc.), default-blocklisted domains, anything while the master toggle is paused, anything in incognito (extension does not opt in).
-- **Where data lives**: a single SQLite file at `~/.pc_agent/memory.db`. Nothing leaves your machine except embedding and chat requests to Gemini.
-- **How to wipe everything**: `rm ~/.pc_agent/memory.db` (or click "Forget all" in the Activity tab once it's built).
+Things you should know:
+
+- **Passwords and credit card fields are never captured.** The content script skips `<input type="password">`, any field with `autocomplete="cc-number"` / `one-time-code` / `current-password` and similar, and fields whose name looks like `ssn`, `otp`, `cvv`, or `pin`.
+- **A default blocklist protects obvious stuff.** Banks, password managers, and Google account pages are excluded out of the box. You can add more in the Activity tab.
+- **Incognito tabs are ignored.** The extension is not allowed in incognito by default.
+- **Your data lives in one file.** It's at `~/.pc_agent/memory.db`. Delete it to wipe everything.
+- **The only thing that leaves your machine** is your question plus the short text snippets it matched, sent to Gemini so it can write an answer. Your browsing history is never sent as a whole.
 
 ## Roadmap
 
-In scope for v0 (this prototype):
+Shipping in v0 (this repo):
 
-- Browser-only capture (pages, selections, form submissions).
-- Personal memory + Q&A with citations.
-- Lightweight action loop for "go check X" via structured DOM extraction.
+- Capturing page visits, highlights, and form inputs from Chrome.
+- Asking questions in English and getting cited answers.
+- "Go check X" style tasks that open a background tab and read a page.
 
-Out of scope for v0 (might revisit):
+Not yet:
 
-- OS-level keystroke capture (browser-only here).
-- Multi-device sync, cloud, auth.
-- Pixel-based computer-use / clicking through complex SPAs.
-- Audio, video, non-browser apps.
-- Background proactive notifications (a scheduler that runs saved queries).
-- Fine-grained PII redaction (rely on domain blocklist + pause for now).
+- Keystroke capture outside the browser (Slack desktop, iMessage, etc).
+- Running on anything other than your own laptop.
+- Clicking through multi-step flows (composing and sending an email, filling out a form).
+- Proactive notifications ("someone replied to your post").
+- More careful PII scrubbing inside the captured text itself.
 
 ## License
 
-MIT — see [LICENSE](LICENSE).
+MIT. See [LICENSE](LICENSE).

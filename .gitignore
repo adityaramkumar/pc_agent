@@ -20,7 +20,7 @@ node_modules/
 extension/dist/
 *.log
 
-# data — never commit captured memory
+# data: never commit captured memory
 *.db
 *.db-journal
 *.db-wal
