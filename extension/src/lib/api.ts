@@ -59,6 +59,16 @@ export async function queryStart(question: string): Promise<QueryResponse> {
   });
 }
 
+export async function queryContinue(
+  sessionId: string,
+  toolResult: Record<string, unknown>,
+): Promise<QueryResponse> {
+  return request<QueryResponse>("/query/continue", {
+    method: "POST",
+    body: JSON.stringify({ session_id: sessionId, tool_result: toolResult }),
+  });
+}
+
 export async function listMemories(
   limit = 50,
   offset = 0,

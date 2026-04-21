@@ -1,7 +1,8 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 
-import { BackendError, queryStart } from "../lib/api";
-import type { Citation } from "../lib/types";
+import { BackendError, queryContinue, queryStart } from "../lib/api";
+import type { RunToolMessage, RunToolResult } from "../lib/messages";
+import type { Citation, QueryResponse } from "../lib/types";
 
 interface UserMessage {
   role: "user";
@@ -19,8 +20,52 @@ interface AssistantMessage {
 
 type Message = UserMessage | AssistantMessage;
 
+const MAX_TOOL_HOPS = 5;
+
 function formatTs(ts: number): string {
   return new Date(ts).toLocaleString();
+}
+
+async function runBrowserTool(
+  tool: "visit_page" | "extract_from_page",
+  args: Record<string, unknown>,
+): Promise<Record<string, unknown>> {
+  const message: RunToolMessage = {
+    kind: "run_tool",
+    tool,
+    args: args as RunToolMessage["args"],
+  };
+  const result = (await chrome.runtime.sendMessage(message)) as RunToolResult | undefined;
+  if (!result) return { ok: false, error: "no response from background" };
+  return result as unknown as Record<string, unknown>;
+}
+
+async function runQueryWithTools(
+  question: string,
+  setStatus: (s: string | null) => void,
+): Promise<QueryResponse> {
+  let response = await queryStart(question);
+  for (let hops = 0; hops < MAX_TOOL_HOPS; hops += 1) {
+    if (response.answer != null || !response.session_id || !response.pending_tool) {
+      setStatus(null);
+      return response;
+    }
+    const tool = response.pending_tool;
+    if (tool !== "visit_page" && tool !== "extract_from_page") {
+      setStatus(null);
+      return {
+        ...response,
+        answer: `(model requested unknown tool: ${tool})`,
+      };
+    }
+    const args = response.args ?? {};
+    const url = typeof args["url"] === "string" ? (args["url"] as string) : "...";
+    setStatus(`Looking at ${url}...`);
+    const result = await runBrowserTool(tool, args);
+    response = await queryContinue(response.session_id, result);
+  }
+  setStatus(null);
+  return response;
 }
 
 function CitationList({ citations }: { citations: Citation[] }) {
@@ -44,21 +89,23 @@ export function AskTab() {
   const [messages, setMessages] = useState<Message[]>([]);
   const [draft, setDraft] = useState("");
   const [loading, setLoading] = useState(false);
+  const [status, setStatus] = useState<string | null>(null);
   const scrollerRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
     const node = scrollerRef.current;
     if (node) node.scrollTop = node.scrollHeight;
-  }, [messages, loading]);
+  }, [messages, loading, status]);
 
   const submit = useCallback(async () => {
     const question = draft.trim();
     if (!question || loading) return;
     setDraft("");
     setLoading(true);
+    setStatus(null);
     setMessages((m) => [...m, { role: "user", text: question, ts: Date.now() }]);
     try {
-      const resp = await queryStart(question);
+      const resp = await runQueryWithTools(question, setStatus);
       setMessages((m) => [
         ...m,
         {
@@ -80,6 +127,7 @@ export function AskTab() {
         { role: "assistant", text: msg, citations: [], error: true, ts: Date.now() },
       ]);
     } finally {
+      setStatus(null);
       setLoading(false);
     }
   }, [draft, loading]);
@@ -118,7 +166,7 @@ export function AskTab() {
         )}
         {loading && (
           <div className="msg assistant loading">
-            <div className="msg-body">Thinking...</div>
+            <div className="msg-body">{status ?? "Thinking..."}</div>
           </div>
         )}
       </div>

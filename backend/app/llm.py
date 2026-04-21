@@ -79,6 +79,121 @@ _SYSTEM_INSTRUCTION = (
 )
 
 
+_AGENTIC_SYSTEM_INSTRUCTION = (
+    "You are pc_agent, the user's personal browser-history assistant. "
+    "You have three tools:\n"
+    "  - search_memory(query): search the user's local browsing history.\n"
+    "  - visit_page(url, wait_for_selector?): open a tab in the background\n"
+    "    and read the page. Use ONLY when the user asks you to go check\n"
+    "    something live (e.g. 'check what X replied').\n"
+    "  - extract_from_page(url, what, css_hint?): read a known page with a\n"
+    "    targeted extraction. Use for SPAs (Gmail, LinkedIn) where Readability\n"
+    "    returns garbage; pass a CSS selector hint for the relevant region.\n\n"
+    "Guidance:\n"
+    "  - Always start with search_memory to see what the user already has.\n"
+    "  - Only use visit_page / extract_from_page when memory alone is\n"
+    "    insufficient and the user is clearly asking you to fetch.\n"
+    "  - When you have enough information, write a short final answer\n"
+    "    naming the URLs and timestamps you used. The system will then\n"
+    "    convert your answer into a structured response with citations."
+)
+
+
+# --- Tool declarations ---------------------------------------------------
+
+SEARCH_MEMORY_TOOL = genai_types.FunctionDeclaration(
+    name="search_memory",
+    description=(
+        "Search the user's local browsing history (pages, selections, form "
+        "inputs they've sent). Returns the top relevant snippets."
+    ),
+    parameters=genai_types.Schema(
+        type=genai_types.Type.OBJECT,
+        properties={
+            "query": genai_types.Schema(
+                type=genai_types.Type.STRING,
+                description="A natural-language search query.",
+            ),
+        },
+        required=["query"],
+    ),
+)
+
+VISIT_PAGE_TOOL = genai_types.FunctionDeclaration(
+    name="visit_page",
+    description=(
+        "Open a URL in a background tab and return the page's main content. "
+        "Uses Readability to extract the article-style text. Best for "
+        "article/blog/docs pages."
+    ),
+    parameters=genai_types.Schema(
+        type=genai_types.Type.OBJECT,
+        properties={
+            "url": genai_types.Schema(type=genai_types.Type.STRING),
+            "wait_for_selector": genai_types.Schema(
+                type=genai_types.Type.STRING,
+                description="Optional CSS selector to wait for before extracting.",
+            ),
+        },
+        required=["url"],
+    ),
+)
+
+EXTRACT_FROM_PAGE_TOOL = genai_types.FunctionDeclaration(
+    name="extract_from_page",
+    description=(
+        "Open a URL and extract content from a specific CSS-targeted region. "
+        "Use this for SPAs (Gmail, LinkedIn, Slack web) where the main "
+        "content lives in dynamic regions and Readability returns junk."
+    ),
+    parameters=genai_types.Schema(
+        type=genai_types.Type.OBJECT,
+        properties={
+            "url": genai_types.Schema(type=genai_types.Type.STRING),
+            "what": genai_types.Schema(
+                type=genai_types.Type.STRING,
+                description="What to look for (free-text, included in the result).",
+            ),
+            "css_hint": genai_types.Schema(
+                type=genai_types.Type.STRING,
+                description="A CSS selector for the region of interest.",
+            ),
+        },
+        required=["url", "what"],
+    ),
+)
+
+
+def all_tools() -> list[genai_types.Tool]:
+    return [
+        genai_types.Tool(
+            function_declarations=[
+                SEARCH_MEMORY_TOOL,
+                VISIT_PAGE_TOOL,
+                EXTRACT_FROM_PAGE_TOOL,
+            ]
+        )
+    ]
+
+
+# --- Agentic-turn output -------------------------------------------------
+
+
+@dataclass(slots=True)
+class FunctionCall:
+    name: str
+    args: dict[str, Any]
+
+
+@dataclass(slots=True)
+class AgenticTurn:
+    """Result of one round-trip with the model in tool-calling mode."""
+
+    function_call: FunctionCall | None
+    text: str | None
+    raw_content: Any  # google.genai Content for the model's reply
+
+
 class GeminiClient:
     """Wraps `google.genai.Client` with the project's defaults applied."""
 
@@ -136,6 +251,24 @@ class GeminiClient:
 
         raise RuntimeError("embed retries exhausted") from last_exc
 
+    async def agentic_turn(self, history: Sequence[Any]) -> AgenticTurn:
+        """One round-trip with the model in tool-calling mode."""
+        # mypy can't reconcile the SDK's covariant `list[Tool|...]` with our
+        # plain `list[Tool]`, so cast at the boundary.
+        tools: Any = all_tools()
+        config = genai_types.GenerateContentConfig(
+            system_instruction=_AGENTIC_SYSTEM_INSTRUCTION,
+            tools=tools,
+            temperature=0.2,
+        )
+        response = await asyncio.to_thread(
+            self._client.models.generate_content,
+            model=self._settings.llm_model,
+            contents=list(history),
+            config=config,
+        )
+        return _parse_agentic_response(response)
+
     async def final_answer(
         self,
         *,
@@ -160,6 +293,38 @@ class GeminiClient:
         )
 
         return _parse_final_answer(response)
+
+
+def _parse_agentic_response(response: Any) -> AgenticTurn:
+    candidates = getattr(response, "candidates", None) or []
+    if not candidates:
+        return AgenticTurn(function_call=None, text=None, raw_content=None)
+    candidate = candidates[0]
+    content = getattr(candidate, "content", None)
+    parts = getattr(content, "parts", None) or []
+
+    text_pieces: list[str] = []
+    fn_call: FunctionCall | None = None
+    for part in parts:
+        function_call = getattr(part, "function_call", None)
+        if function_call is not None:
+            args = getattr(function_call, "args", {}) or {}
+            # google.genai gives us a dict-like; coerce to plain dict.
+            try:
+                args = dict(args)
+            except Exception:
+                args = {}
+            fn_call = FunctionCall(name=function_call.name, args=args)
+            break  # only one function call per turn for our purposes
+        text = getattr(part, "text", None)
+        if text:
+            text_pieces.append(text)
+
+    return AgenticTurn(
+        function_call=fn_call,
+        text="".join(text_pieces) if text_pieces else None,
+        raw_content=content,
+    )
 
 
 def _build_final_prompt(question: str, retrieved: Sequence[RetrievedChunk]) -> str:
@@ -233,10 +398,13 @@ def reset_client_for_tests() -> None:
 # Surface the genai types module for callers that need to construct
 # `FunctionDeclaration` etc. without importing google.genai directly.
 __all__ = [
+    "AgenticTurn",
     "Citation",
     "EmbedResult",
     "FinalAnswer",
+    "FunctionCall",
     "GeminiClient",
+    "all_tools",
     "genai_types",
     "get_gemini_client",
     "reset_client_for_tests",
