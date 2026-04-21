@@ -15,6 +15,7 @@ infrequent enough that a simple locking story works.
 from __future__ import annotations
 
 import json
+import re
 import threading
 from collections.abc import Iterator
 from contextlib import contextmanager
@@ -56,6 +57,18 @@ class IngestEvent:
     text: str | None
     ts: int
     meta: dict[str, Any]
+
+
+@dataclass(slots=True)
+class RetrievedChunk:
+    chunk_id: int
+    event_id: int
+    text: str
+    ts: int
+    url: str
+    title: str | None
+    score: float
+    sources: tuple[str, ...]  # which retrievers contributed (e.g. ("vec", "fts"))
 
 
 _SCHEMA = """
@@ -225,6 +238,128 @@ class Store:
         with self.connect() as conn:
             row = conn.execute("SELECT COUNT(*) AS n FROM events").fetchone()
         return int(row["n"])
+
+    # --- chunks + vectors --------------------------------------------------
+
+    def insert_chunks(self, *, event_id: int, texts: list[str], ts: int) -> list[int]:
+        if not texts:
+            return []
+        ids: list[int] = []
+        with self.connect() as conn:
+            cur = conn.cursor()
+            for text in texts:
+                cur.execute(
+                    "INSERT INTO chunks (event_id, text, ts) VALUES (?, ?, ?)",
+                    (event_id, text, ts),
+                )
+                row_id = cur.lastrowid
+                if row_id is None:
+                    raise RuntimeError("sqlite did not return a lastrowid for chunks insert")
+                ids.append(int(row_id))
+        return ids
+
+    def insert_chunk_vectors(self, items: list[tuple[int, list[float]]]) -> None:
+        if not items:
+            return
+        import struct
+
+        with self.connect() as conn:
+            cur = conn.cursor()
+            for chunk_id, vector in items:
+                blob = struct.pack(f"{len(vector)}f", *vector)
+                cur.execute(
+                    "INSERT OR REPLACE INTO chunk_vectors(chunk_id, embedding) VALUES (?, ?)",
+                    (chunk_id, blob),
+                )
+
+    def vector_search(self, query_vector: list[float], *, k: int = 20) -> list[tuple[int, float]]:
+        """Returns (chunk_id, distance) pairs ordered by ascending distance."""
+        if not query_vector:
+            return []
+        import struct
+
+        blob = struct.pack(f"{len(query_vector)}f", *query_vector)
+        with self.connect() as conn:
+            try:
+                rows = conn.execute(
+                    """
+                    SELECT chunk_id, distance
+                    FROM chunk_vectors
+                    WHERE embedding MATCH ?
+                      AND k = ?
+                    ORDER BY distance
+                    """,
+                    (blob, k),
+                ).fetchall()
+            except sqlite3.OperationalError as exc:
+                # Empty vec0 tables sometimes raise on KNN queries with 0 rows;
+                # treat as no results rather than a hard failure.
+                if "no such" in str(exc).lower() or "match" in str(exc).lower():
+                    return []
+                raise
+        return [(int(r["chunk_id"]), float(r["distance"])) for r in rows]
+
+    def fts_search(self, query: str, *, k: int = 20) -> list[tuple[int, float]]:
+        """Returns (chunk_id, bm25_score) pairs. Lower bm25 = more relevant."""
+        cleaned = _sanitize_fts_query(query)
+        if not cleaned:
+            return []
+        with self.connect() as conn:
+            try:
+                rows = conn.execute(
+                    """
+                    SELECT rowid, bm25(chunks_fts) AS score
+                    FROM chunks_fts
+                    WHERE chunks_fts MATCH ?
+                    ORDER BY score
+                    LIMIT ?
+                    """,
+                    (cleaned, k),
+                ).fetchall()
+            except sqlite3.OperationalError:
+                return []
+        return [(int(r["rowid"]), float(r["score"])) for r in rows]
+
+    def fetch_chunks(self, chunk_ids: list[int]) -> list[RetrievedChunk]:
+        """Hydrate a list of chunk IDs with chunk + event metadata."""
+        if not chunk_ids:
+            return []
+        placeholders = ",".join("?" * len(chunk_ids))
+        with self.connect() as conn:
+            rows = conn.execute(
+                f"""
+                SELECT c.id AS chunk_id, c.event_id, c.text, c.ts,
+                       e.url, e.title
+                FROM chunks c JOIN events e ON e.id = c.event_id
+                WHERE c.id IN ({placeholders})
+                """,
+                chunk_ids,
+            ).fetchall()
+        return [
+            RetrievedChunk(
+                chunk_id=int(r["chunk_id"]),
+                event_id=int(r["event_id"]),
+                text=r["text"],
+                ts=int(r["ts"]),
+                url=r["url"],
+                title=r["title"],
+                score=0.0,
+                sources=(),
+            )
+            for r in rows
+        ]
+
+
+_FTS_TOKEN_RE = re.compile(r"[A-Za-z0-9]+")
+
+
+def _sanitize_fts_query(query: str) -> str:
+    """FTS5's MATCH grammar is picky; reduce to a safe OR of tokens."""
+    tokens = _FTS_TOKEN_RE.findall(query)
+    if not tokens:
+        return ""
+    quoted = [f'"{t}"' for t in tokens if len(t) >= 2]
+    return " OR ".join(quoted)
 
 
 def _row_to_event(row: sqlite3.Row) -> EventRow:

@@ -4,28 +4,26 @@ Two distinct call modes (Gemini does *not* allow JSON-mode and tools together):
 
 * `agentic_turn(history, tools)` — used inside the action loop. Tools enabled,
   no JSON mode. Returns either a `function_call` or free-text continuation.
-* `final_answer(history, schema)` — called once after the agentic loop
-  completes. No tools, response_mime_type=application/json with a Pydantic
-  schema describing `{answer, citations}`. This produces the side-panel output.
-
-Both modes share the same underlying client, model, and generation config.
-The full implementation lands in the memory_indexing / action_loop steps;
-for the backend skeleton this exposes only the client factory + an
-`embed_documents` helper used by the ingest pipeline.
+* `final_answer(question, retrieved)` — no tools, response_mime_type=
+  application/json with a schema describing `{answer, citations}`. This is the
+  call that produces the side-panel-rendered output.
 """
 
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 from collections.abc import Sequence
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from typing import Any
 
 from google import genai
 from google.genai import types as genai_types
 
 from app.config import Settings, get_settings
+from app.store import RetrievedChunk
 
 logger = logging.getLogger(__name__)
 
@@ -36,6 +34,49 @@ _RETRYABLE_STATUSES = {429, 500, 502, 503, 504}
 @dataclass(slots=True)
 class EmbedResult:
     vectors: list[list[float]]
+
+
+@dataclass(slots=True)
+class Citation:
+    url: str
+    ts: int
+    snippet: str
+
+
+@dataclass(slots=True)
+class FinalAnswer:
+    answer: str
+    citations: list[Citation]
+
+
+_FINAL_ANSWER_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "answer": {"type": "string"},
+        "citations": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "url": {"type": "string"},
+                    "ts": {"type": "integer"},
+                    "snippet": {"type": "string"},
+                },
+                "required": ["url", "ts", "snippet"],
+            },
+        },
+    },
+    "required": ["answer", "citations"],
+}
+
+
+_SYSTEM_INSTRUCTION = (
+    "You are pc_agent, the user's personal browser-history assistant. "
+    "Answer the user's question using ONLY the provided memories from their "
+    "own browsing. If the memories don't contain enough information, say so "
+    "honestly rather than guessing. Always include citations: copy the "
+    "URL/ts/snippet of every memory you actually used. Be concise."
+)
 
 
 class GeminiClient:
@@ -95,6 +136,76 @@ class GeminiClient:
 
         raise RuntimeError("embed retries exhausted") from last_exc
 
+    async def final_answer(
+        self,
+        *,
+        question: str,
+        retrieved: Sequence[RetrievedChunk],
+    ) -> FinalAnswer:
+        """Single-shot answer-with-citations call. No tools, JSON output."""
+        prompt = _build_final_prompt(question, retrieved)
+
+        config = genai_types.GenerateContentConfig(
+            system_instruction=_SYSTEM_INSTRUCTION,
+            response_mime_type="application/json",
+            response_schema=_FINAL_ANSWER_SCHEMA,
+            temperature=0.2,
+        )
+
+        response = await asyncio.to_thread(
+            self._client.models.generate_content,
+            model=self._settings.llm_model,
+            contents=prompt,
+            config=config,
+        )
+
+        return _parse_final_answer(response)
+
+
+def _build_final_prompt(question: str, retrieved: Sequence[RetrievedChunk]) -> str:
+    if not retrieved:
+        body = "(no memories matched the question)"
+    else:
+        body = "\n\n".join(_format_chunk(i, c) for i, c in enumerate(retrieved, start=1))
+    return (
+        f"# Question\n{question}\n\n"
+        f"# Memories from the user's browsing\n{body}\n\n"
+        "# Task\nAnswer the question using only the memories above. "
+        "Include citations for the memories you used."
+    )
+
+
+def _format_chunk(idx: int, chunk: RetrievedChunk) -> str:
+    iso = datetime.fromtimestamp(chunk.ts / 1000, tz=UTC).isoformat()
+    title = chunk.title or chunk.url
+    return (
+        f"[{idx}] {title}\n"
+        f"    url: {chunk.url}\n"
+        f"    ts:  {chunk.ts}  ({iso})\n"
+        f"    text: {chunk.text}"
+    )
+
+
+def _parse_final_answer(response: Any) -> FinalAnswer:
+    raw = getattr(response, "text", None)
+    if not raw:
+        return FinalAnswer(answer="(no response from model)", citations=[])
+    try:
+        payload = json.loads(raw)
+    except json.JSONDecodeError:
+        return FinalAnswer(answer=raw, citations=[])
+    citations_raw = payload.get("citations") or []
+    citations = [
+        Citation(
+            url=str(c.get("url", "")),
+            ts=int(c.get("ts", 0)),
+            snippet=str(c.get("snippet", "")),
+        )
+        for c in citations_raw
+        if isinstance(c, dict)
+    ]
+    return FinalAnswer(answer=str(payload.get("answer", "")), citations=citations)
+
 
 def _extract_status(exc: Exception) -> int | None:
     for attr in ("status_code", "code"):
@@ -122,12 +233,11 @@ def reset_client_for_tests() -> None:
 # Surface the genai types module for callers that need to construct
 # `FunctionDeclaration` etc. without importing google.genai directly.
 __all__ = [
+    "Citation",
     "EmbedResult",
+    "FinalAnswer",
     "GeminiClient",
     "genai_types",
     "get_gemini_client",
     "reset_client_for_tests",
 ]
-
-
-_ = Any  # keep typing import used; placeholder for forthcoming agentic types

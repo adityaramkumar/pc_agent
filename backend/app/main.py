@@ -13,15 +13,21 @@ memory_indexing / action_loop steps.
 
 from __future__ import annotations
 
+import logging
 from typing import Annotated, Any
 
-from fastapi import Depends, FastAPI, HTTPException, status
+from fastapi import BackgroundTasks, Depends, FastAPI, HTTPException, status
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
 from app import __version__
 from app.config import Settings, get_settings
+from app.llm import Citation, FinalAnswer
+from app.processor import Processor, get_processor
+from app.rag import Retriever, get_retriever
 from app.store import EventRow, IngestEvent, Store, get_store
+
+logger = logging.getLogger(__name__)
 
 
 class HealthResponse(BaseModel):
@@ -74,12 +80,59 @@ class MemoriesResponse(BaseModel):
     events: list[EventOut]
 
 
+class CitationOut(BaseModel):
+    url: str
+    ts: int
+    snippet: str
+
+    @classmethod
+    def from_model(cls, c: Citation) -> CitationOut:
+        return cls(url=c.url, ts=c.ts, snippet=c.snippet)
+
+
+class QueryStartRequest(BaseModel):
+    question: str = Field(min_length=1, max_length=4000)
+
+
+class QueryResponse(BaseModel):
+    """Side-panel response shape.
+
+    `answer` and `citations` are populated when the agentic loop is done.
+    `pending_tool` / `args` / `session_id` are reserved for the action_loop
+    step (memory_indexing always returns a final answer in one shot).
+    """
+
+    answer: str | None = None
+    citations: list[CitationOut] = Field(default_factory=list)
+    session_id: str | None = None
+    pending_tool: str | None = None
+    args: dict[str, Any] | None = None
+
+
 def _store_dep(settings: Annotated[Settings, Depends(get_settings)]) -> Store:
     return get_store(settings)
 
 
+def _processor_dep() -> Processor:
+    return get_processor()
+
+
+def _retriever_dep() -> Retriever:
+    return get_retriever()
+
+
 SettingsDep = Annotated[Settings, Depends(get_settings)]
 StoreDep = Annotated[Store, Depends(_store_dep)]
+ProcessorDep = Annotated[Processor, Depends(_processor_dep)]
+RetrieverDep = Annotated[Retriever, Depends(_retriever_dep)]
+
+
+async def _process_event_safely(processor: Processor, event_id: int) -> None:
+    """Background task wrapper that never lets ingest fail because of LLM errors."""
+    try:
+        await processor.process_event(event_id)
+    except Exception as exc:  # pragma: no cover - defensive
+        logger.warning("background processing failed for event %d: %s", event_id, exc)
 
 
 def create_app() -> FastAPI:
@@ -98,7 +151,12 @@ def create_app() -> FastAPI:
         return HealthResponse(status="ok", version=__version__)
 
     @app.post("/ingest", response_model=IngestResponse)
-    async def ingest(body: IngestRequest, store: StoreDep) -> IngestResponse:
+    async def ingest(
+        body: IngestRequest,
+        background: BackgroundTasks,
+        store: StoreDep,
+        processor: ProcessorDep,
+    ) -> IngestResponse:
         events = [
             IngestEvent(
                 type=e.type,
@@ -111,7 +169,31 @@ def create_app() -> FastAPI:
             for e in body.events
         ]
         ids = store.insert_events(events)
+        # Queue chunking + embedding so the request returns immediately;
+        # only events that actually carry text are worth processing.
+        for ev_id, ev in zip(ids, events, strict=True):
+            if ev.text:
+                background.add_task(_process_event_safely, processor, ev_id)
         return IngestResponse(ingested=len(ids), ids=ids)
+
+    @app.post("/query/start", response_model=QueryResponse)
+    async def query_start(body: QueryStartRequest, retriever: RetrieverDep) -> QueryResponse:
+        retrieved = await retriever.search(body.question)
+        client = retriever._client
+        try:
+            final: FinalAnswer = await client.final_answer(
+                question=body.question, retrieved=retrieved
+            )
+        except Exception as exc:
+            logger.exception("LLM final_answer failed: %s", exc)
+            raise HTTPException(
+                status_code=status.HTTP_502_BAD_GATEWAY,
+                detail="LLM call failed; check backend logs",
+            ) from exc
+        return QueryResponse(
+            answer=final.answer,
+            citations=[CitationOut.from_model(c) for c in final.citations],
+        )
 
     @app.get("/memories", response_model=MemoriesResponse)
     async def list_memories(
