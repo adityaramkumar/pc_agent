@@ -17,6 +17,7 @@ from typing import Any
 from app.store import RetrievedChunk
 
 SESSION_IDLE_TIMEOUT_SEC = 300
+_EVICTION_INTERVAL_SEC = 60
 MAX_TURNS = 5
 
 
@@ -35,10 +36,25 @@ class Session:
 
 
 class SessionStore:
-    def __init__(self, idle_timeout: float = SESSION_IDLE_TIMEOUT_SEC) -> None:
+    def __init__(
+        self,
+        idle_timeout: float = SESSION_IDLE_TIMEOUT_SEC,
+        eviction_interval: float = _EVICTION_INTERVAL_SEC,
+    ) -> None:
         self._sessions: dict[str, Session] = {}
         self._lock = threading.Lock()
         self._idle_timeout = idle_timeout
+        self._start_eviction_thread(eviction_interval)
+
+    def _start_eviction_thread(self, interval: float) -> None:
+        def _loop() -> None:
+            while True:
+                time.sleep(interval)
+                with self._lock:
+                    self._evict_expired_locked()
+
+        t = threading.Thread(target=_loop, daemon=True, name="session-eviction")
+        t.start()
 
     def create(self, question: str) -> Session:
         sess = Session(id=uuid.uuid4().hex, question=question)
