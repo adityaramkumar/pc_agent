@@ -165,7 +165,15 @@ async def drive_and_finalize(
     finally:
         sessions.drop(sess.id)
 
+    # Deduplicate citations by URL, preserving first occurrence.
+    seen_urls: set[str] = set()
+    unique_citations = []
+    for c in final.citations:
+        if c.url not in seen_urls:
+            seen_urls.add(c.url)
+            unique_citations.append(c)
+
     return AgenticResult(
         answer=final.answer,
-        citations=list(final.citations),
+        citations=unique_citations,
     )
