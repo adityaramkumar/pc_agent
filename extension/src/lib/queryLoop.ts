@@ -82,5 +82,16 @@ export async function runQueryWithTools(
   }
 
   hooks.onToolEnd?.();
+  // Exhausted all hops without reaching a final answer.
+  if (response.pending_tool) {
+    return {
+      answer:
+        "(the assistant needed more steps than allowed; please try a more specific question)",
+      citations: [],
+      session_id: null,
+      pending_tool: null,
+      args: null,
+    };
+  }
   return response;
 }
