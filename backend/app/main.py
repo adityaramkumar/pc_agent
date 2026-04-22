@@ -17,6 +17,8 @@ in `llm.py`; prompts in `prompts.py`; tool declarations in `tools.py`.
 from __future__ import annotations
 
 import logging
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 
 from fastapi import BackgroundTasks, FastAPI, HTTPException, status
 from fastapi.middleware.cors import CORSMiddleware
@@ -29,6 +31,7 @@ from app.agentic import (
     last_function_call_name,
     user_content,
 )
+from app.config import get_settings
 from app.deps import LLMDep, ProcessorDep, RetrieverDep, SessionsDep, StoreDep
 from app.processor import Processor
 from app.schemas import (
@@ -68,15 +71,26 @@ def _result_to_response(result: AgenticResult) -> QueryResponse:
     )
 
 
+@asynccontextmanager
+async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
+    settings = get_settings()
+    if not settings.google_api_key:
+        logger.error(
+            "GOOGLE_API_KEY is not set. Set it in backend/.env or as an environment variable. "
+            "All LLM and embedding calls will fail until it is provided."
+        )
+    yield
+
+
 def create_app() -> FastAPI:
-    app = FastAPI(title="pc_agent", version=__version__)
+    app = FastAPI(title="pc_agent", version=__version__, lifespan=_lifespan)
 
     app.add_middleware(
         CORSMiddleware,
         allow_origin_regex=r"^chrome-extension://.*$",
         allow_credentials=False,
         allow_methods=["GET", "POST", "DELETE", "OPTIONS"],
-        allow_headers=["*"],
+        allow_headers=["Content-Type"],
     )
 
     # --- Health ----------------------------------------------------------
