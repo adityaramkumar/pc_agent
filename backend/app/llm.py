@@ -42,6 +42,7 @@ _RETRYABLE_STATUSES = {429, 500, 502, 503, 504}
 _MAX_EMBED_RETRIES = 5
 _EMBED_INITIAL_DELAY = 1.0
 _EMBED_MAX_DELAY = 32.0
+_LLM_CALL_TIMEOUT_SEC = 60.0
 
 
 @dataclass(slots=True)
@@ -150,11 +151,14 @@ class GeminiClient:
             tools=tools,
             temperature=0.2,
         )
-        response = await asyncio.to_thread(
-            self._client.models.generate_content,
-            model=self._settings.llm_model,
-            contents=list(history),
-            config=config,
+        response = await asyncio.wait_for(
+            asyncio.to_thread(
+                self._client.models.generate_content,
+                model=self._settings.llm_model,
+                contents=list(history),
+                config=config,
+            ),
+            timeout=_LLM_CALL_TIMEOUT_SEC,
         )
         return parse_agentic_response(response)
 
@@ -175,11 +179,14 @@ class GeminiClient:
             temperature=0.2,
         )
 
-        response = await asyncio.to_thread(
-            self._client.models.generate_content,
-            model=self._settings.llm_model,
-            contents=prompt,
-            config=config,
+        response = await asyncio.wait_for(
+            asyncio.to_thread(
+                self._client.models.generate_content,
+                model=self._settings.llm_model,
+                contents=prompt,
+                config=config,
+            ),
+            timeout=_LLM_CALL_TIMEOUT_SEC,
         )
 
         return parse_final_answer(response)
